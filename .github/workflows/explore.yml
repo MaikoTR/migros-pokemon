@@ -1,0 +1,13 @@
+name: Explore (temporary)
+on:
+  push:
+    branches: [explore]
+permissions:
+  contents: read
+jobs:
+  explore:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v7
+      - run: node explore.mjs
