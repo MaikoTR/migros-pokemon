@@ -10,4 +10,5 @@ jobs:
     timeout-minutes: 15
     steps:
       - uses: actions/checkout@v7
+      - run: curl -sSfL https://download.geonames.org/export/zip/CH.zip -o CH.zip && unzip -o CH.zip CH.txt
       - run: node explore.mjs
