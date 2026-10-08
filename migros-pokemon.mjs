@@ -3,22 +3,28 @@
  * Migros Pokémon stock checker
  * ----------------------------------------------------------------------------
  * Lists every Pokémon product Migros sells and how many are in stock at the
- * Migros store(s) in Zofingen (or any other town), using the same public API
- * the migros.ch website uses. No dependencies, needs Node.js 18 or newer.
+ * Migros stores serving a list of postal codes (postcodes.json: every postal
+ * code within 10 km of Zofingen), using the same public API migros.ch uses.
+ * Visitors pick which postal codes they want to see on the page.
+ * No dependencies, needs Node.js 18 or newer.
  *
  *   node migros-pokemon.mjs                 start the page at http://localhost:4800
- *   node migros-pokemon.mjs --out pokemon.html   save a one-off snapshot page
  *   node migros-pokemon.mjs --list          print the stock list in the terminal
  *   node migros-pokemon.mjs --site public   write a static website (index.html + data.json)
+ *   node migros-pokemon.mjs --out page.html save a one-off snapshot page
  *
  * Options
- *   --store <town>     town or store name to look up      (default: Zofingen)
- *   --zip <code>       postcode used to pick the stores    (default: 4800)
- *   --store-ids <ids>  comma-separated Migros store ids, skips the store lookup
- *   --query <text>     product search                      (default: pokemon)
- *   --port <n>         port for the page                   (default: 4800)
+ *   --postcodes <file> postal codes to cover            (default: postcodes.json next to this script)
+ *   --place <name>     area name in the page title      (default: Zofingen)
+ *   --max-km <n>       ignore postal codes whose nearest Migros is further away (default: 10)
+ *   --query <text>     product search                   (default: pokemon)
+ *   --port <n>         port for the page                (default: 4800)
  *   --local            only reachable from this computer (default: also your Wi-Fi)
  *   --note <text>      extra line in the page footer (e.g. how often it updates)
+ *
+ * postcodes.json is a list of {"plz", "name", "km", "lat", "lng"} (lat/lng optional).
+ * Each postal code maps to the Migros stores located in it, or to the nearest
+ * Migros when it has none.
  *
  * Not affiliated with Migros. Their API is unofficial and can change.
  */
@@ -38,9 +44,9 @@ if (args.help || args.h) {
 }
 
 const CONFIG = {
-  store: String(args.store ?? "Zofingen"),
-  zip: String(args.zip ?? "4800"),
-  storeIds: args["store-ids"] ? String(args["store-ids"]).split(",").map((s) => s.trim()).filter(Boolean) : null,
+  place: String(args.place ?? "Zofingen"),
+  postcodesFile: args.postcodes ? String(args.postcodes) : new URL("postcodes.json", import.meta.url),
+  maxKm: Number(args["max-km"] ?? 10),
   query: String(args.query ?? "pokemon"),
   port: Number(args.port ?? 4800),
   host: args.local ? "127.0.0.1" : "0.0.0.0",
@@ -51,6 +57,7 @@ const CONFIG = {
 // Only for testing against a local mock; leave unset for the real site.
 const BASE_URL = process.env.MIGROS_BASE || "https://www.migros.ch";
 const MATCH = /pok[eé]mon/i;
+const STOCK_BATCH = 10; // Migros accepts at most 10 stores per stock lookup
 
 // ─── HTTP client ────────────────────────────────────────────────────────────
 // migros.ch sits behind Cloudflare, which rejects clients that don't look like
@@ -112,6 +119,17 @@ function request(method, path, { params, body, token } = {}) {
   });
 }
 
+// One retry for server hiccups and dropped connections.
+async function again(fn) {
+  try {
+    return await fn();
+  } catch (err) {
+    if (err.status && err.status < 500) throw err;
+    await new Promise((r) => setTimeout(r, 1500));
+    return fn();
+  }
+}
+
 // ─── Guest token ────────────────────────────────────────────────────────────
 
 let token = null;
@@ -139,6 +157,7 @@ async function withToken(fn) {
 // ─── Migros API calls ───────────────────────────────────────────────────────
 
 const api = {
+  // The 10 Migros stores nearest to a postal code or town.
   stores: (query) =>
     withToken((t) => request("GET", "/store/public/v1/stores/search", { params: { query }, token: t })).then((r) => r.data),
 
@@ -178,6 +197,7 @@ const api = {
       })
     ).then((r) => r.data),
 
+  // Stock of one product in up to 10 stores.
   stock: (uid, costCenterIds) =>
     withToken((t) =>
       request("GET", `/store-availability/public/v2/availabilities/products/${uid}`, {
@@ -189,42 +209,83 @@ const api = {
 
 // ─── Gathering the data ─────────────────────────────────────────────────────
 
-async function findStores(notes) {
-  if (CONFIG.storeIds) {
-    return CONFIG.storeIds.map((id) => ({ id, name: `Store ${id}`, address: "", hoursToday: null }));
+function loadPostcodes() {
+  try {
+    const list = JSON.parse(fs.readFileSync(CONFIG.postcodesFile, "utf8"));
+    if (Array.isArray(list) && list.length) return list.map((p) => ({ ...p, plz: String(p.plz) }));
+  } catch (err) {
+    if (args.postcodes) throw new Error(`Couldn't read ${args.postcodes}: ${err.message}`);
   }
-  let found = (await api.stores(CONFIG.store)) || [];
-  if (!found.length) found = (await api.stores(CONFIG.zip)) || [];
-  const want = CONFIG.store.toLowerCase();
-  let picked = found.filter((s) => {
-    const city = (s.location?.city || "").toLowerCase();
-    const name = (s.storeName || s.name || "").toLowerCase();
-    return city === want || name.startsWith(want) || s.location?.zip === CONFIG.zip;
-  });
-  if (picked.length === 0 && found.length) {
-    notes.push(`No store is listed in ${CONFIG.store}; showing the nearest store Migros returned instead.`);
-    picked = found.slice(0, 1);
-  }
-  if (picked.length === 0) throw new Error(`Migros didn't return any store for "${CONFIG.store}". Try --store with another town.`);
+  return [{ plz: "4800", name: "Zofingen", km: 0 }];
+}
+
+function toStore(s) {
   const today = todayZurich();
-  return picked.map((s) => {
-    const day = (s.openingHours || []).find((d) => d.date === today);
-    const slot = day?.hours?.find((h) => h.open && h.close);
-    return {
-      id: s.costCenterId || s.storeId,
-      name: s.storeName || s.name || `Store ${s.storeId}`,
-      address: [s.location?.address, [s.location?.zip, s.location?.city].filter(Boolean).join(" ")].filter(Boolean).join(", "),
-      type: s.storeType || null,
-      hoursToday: day ? (slot ? `${slot.open.slice(11, 16)}–${slot.close.slice(11, 16)}` : "closed") : null,
+  const day = (s.openingHours || []).find((d) => d.date === today);
+  const slot = day?.hours?.find((h) => h.open && h.close);
+  const loc = s.location || {};
+  return {
+    id: s.costCenterId || s.storeId,
+    name: s.storeName || s.name || `Store ${s.storeId}`,
+    address: [loc.address, [loc.zip, loc.city].filter(Boolean).join(" ")].filter(Boolean).join(", "),
+    zip: loc.zip || "",
+    type: s.storeType || null,
+    hoursToday: day ? (slot ? `${slot.open.slice(11, 16)}–${slot.close.slice(11, 16)}` : "closed") : null,
+    lat: loc.latitude ?? null,
+    lng: loc.longitude ?? null,
+  };
+}
+
+// For every postal code: the Migros stores located in it, or the nearest one.
+async function findArea(notes) {
+  const list = loadPostcodes();
+  const stores = new Map();
+  const found = new Array(list.length);
+  const skipped = [];
+
+  await pool(list.map((pc, i) => [pc, i]), 4, async ([pc, i]) => {
+    const results = ((await again(() => api.stores(pc.plz))) || []).filter((s) => s.location);
+    const cands = results.map((s, order) => ({
+      s,
+      order,
+      d: pc.lat != null && s.location.latitude != null ? distanceKm(pc.lat, pc.lng, s.location.latitude, s.location.longitude) : null,
+    }));
+    let chosen = cands.filter((c) => c.s.location.zip === pc.plz);
+    const nearest = chosen.length === 0;
+    if (nearest) chosen = cands.sort((a, b) => (a.d ?? a.order) - (b.d ?? b.order)).slice(0, 1);
+    // No store, or only far-away ones: Migros doesn't recognise this code (PO box or company codes).
+    if (!chosen.length || (nearest && chosen[0].d != null && chosen[0].d > CONFIG.maxKm)) {
+      skipped.push(pc.plz);
+      return;
+    }
+    for (const c of chosen) {
+      const st = toStore(c.s);
+      if (!stores.has(st.id)) stores.set(st.id, st);
+    }
+    found[i] = {
+      plz: pc.plz,
+      name: pc.name || pc.plz,
+      km: pc.km ?? null,
+      stores: chosen.map((c) => c.s.costCenterId || c.s.storeId),
+      nearest,
+      nearestKm: nearest && chosen[0].d != null ? Math.round(chosen[0].d * 10) / 10 : null,
     };
   });
+
+  const postcodes = found.filter(Boolean);
+  if (!postcodes.length) throw new Error("Migros didn't return a store for any of the postal codes.");
+  if (skipped.length) console.log(`Skipped postal codes Migros doesn't serve: ${skipped.join(", ")}`);
+
+  // Stores in the order of the postal codes that use them (closest to the centre first).
+  const order = [...new Set(postcodes.flatMap((p) => p.stores))];
+  return { postcodes, stores: order.map((id) => stores.get(id)) };
 }
 
 async function searchAllIds(query, region, filters) {
   const ids = [];
   let features = [];
   for (let page = 0; page < 10; page++) {
-    const r = await api.search(query, region, filters, ids.length);
+    const r = await again(() => api.search(query, region, filters, ids.length));
     if (page === 0) features = r?.features || [];
     const batch = r?.productIds || [];
     ids.push(...batch);
@@ -248,21 +309,18 @@ async function findProducts(region, notes) {
 
   // Everything filed under the Pokémon brand (what migros.ch/de/brand/pokemon shows).
   if (brandSlugs.size) {
-    for (const q of ["", CONFIG.query]) {
-      try {
-        const { ids } = await searchAllIds(q, region, { brand: [...brandSlugs] });
-        ids.forEach((id) => brandIds.add(id));
-        if (ids.length) break;
-      } catch {
-        /* this filter variant isn't accepted; the text search still covers it */
-      }
+    try {
+      const { ids } = await searchAllIds(CONFIG.query, region, { brand: [...brandSlugs] });
+      ids.forEach((id) => brandIds.add(id));
+    } catch {
+      /* filter not accepted; the text search still covers it */
     }
   }
 
   const allIds = [...new Set([...brandIds, ...textIds])];
   const cards = [];
   for (let i = 0; i < allIds.length; i += 30) {
-    cards.push(...((await api.productCards(allIds.slice(i, i + 30), region)) || []));
+    cards.push(...((await again(() => api.productCards(allIds.slice(i, i + 30), region))) || []));
   }
   const products = cards.filter((c) => brandIds.has(c.uid) || MATCH.test(`${c.brand || ""} ${c.name || ""} ${c.title || ""}`));
   if (!products.length) notes.push(`Migros returned no products for "${CONFIG.query}".`);
@@ -271,13 +329,17 @@ async function findProducts(region, notes) {
 
 async function fetchStock(products, stores) {
   const ids = stores.map((s) => s.id);
-  await pool(products, 4, async (p) => {
+  const chunks = [];
+  for (let i = 0; i < ids.length; i += STOCK_BATCH) chunks.push(ids.slice(i, i + STOCK_BATCH));
+  for (const p of products) p.stock = {};
+  const jobs = products.flatMap((p) => chunks.map((chunk) => [p, chunk]));
+  await pool(jobs, 4, async ([p, chunk]) => {
     try {
-      const r = await api.stock(p.uid, ids);
+      const r = await again(() => api.stock(p.uid, chunk));
       const byId = Object.fromEntries((r?.availabilities || []).map((a) => [a.id, Number(a.stock)]));
-      p.stock = Object.fromEntries(ids.map((id) => [id, Number.isFinite(byId[id]) ? byId[id] : 0]));
+      for (const id of chunk) p.stock[id] = Number.isFinite(byId[id]) ? byId[id] : 0;
     } catch {
-      p.stock = Object.fromEntries(ids.map((id) => [id, null]));
+      for (const id of chunk) p.stock[id] = null;
     }
   });
 }
@@ -285,13 +347,13 @@ async function fetchStock(products, stores) {
 async function gather() {
   const started = Date.now();
   const notes = [];
+  const { postcodes, stores } = await findArea(notes);
   let region = "national";
   try {
-    region = (await api.cooperative(CONFIG.zip)) || "national";
+    region = (await api.cooperative(postcodes[0].plz)) || "national";
   } catch {
     /* national prices are fine as a fallback */
   }
-  const stores = await findStores(notes);
   const cards = await findProducts(region, notes);
   const products = cards.map(toProduct);
   await fetchStock(products, stores);
@@ -303,8 +365,11 @@ async function gather() {
   return {
     generatedAt: new Date().toISOString(),
     tookMs: Date.now() - started,
-    place: CONFIG.store,
+    place: CONFIG.place,
+    radiusKm: CONFIG.maxKm,
     region,
+    defaultPostcodes: [postcodes[0].plz],
+    postcodes,
     stores,
     products,
     notes,
@@ -339,6 +404,12 @@ function todayZurich() {
   return new Intl.DateTimeFormat("sv-SE", { timeZone: "Europe/Zurich" }).format(new Date());
 }
 
+function distanceKm(lat1, lng1, lat2, lng2) {
+  const r = Math.PI / 180;
+  const a = Math.sin(((lat2 - lat1) * r) / 2) ** 2 + Math.cos(lat1 * r) * Math.cos(lat2 * r) * Math.sin(((lng2 - lng1) * r) / 2) ** 2;
+  return 2 * 6371 * Math.asin(Math.sqrt(a));
+}
+
 async function pool(items, size, fn) {
   let next = 0;
   const workers = Array.from({ length: Math.min(size, items.length) }, async () => {
@@ -367,32 +438,39 @@ function lanAddresses() {
     .map((n) => n.address);
 }
 
+function storeBreakdown(data, p) {
+  return data.stores
+    .filter((s) => p.stock[s.id] !== 0)
+    .map((s) => `${s.name} ${p.stock[s.id] ?? "?"}`)
+    .join(", ");
+}
+
 function printList(data) {
   const pad = (s, n) => String(s).padEnd(n).slice(0, n);
-  console.log(`\nPokémon at Migros ${data.place} — ${data.stores.map((s) => s.name).join(", ")}`);
+  console.log(`\nPokémon at Migros around ${data.place}: ${data.stores.length} stores for ${data.postcodes.length} postal codes`);
   for (const p of data.products) {
     const stock = p.total === null ? "  ?" : String(p.total).padStart(3);
-    const price = p.price != null ? `CHF ${p.price.toFixed(2)}` : "";
-    console.log(`${stock}  ${pad(p.name, 58)} ${price}`);
+    const price = p.price != null ? `CHF ${p.price.toFixed(2)}`.padEnd(11) : "".padEnd(11);
+    console.log(`${stock}  ${pad(p.name, 46)} ${price} ${storeBreakdown(data, p)}`);
   }
   const inStock = data.products.filter((p) => p.total > 0).length;
-  console.log(`\n${inStock} of ${data.products.length} products in stock.`);
+  console.log(`\n${inStock} of ${data.products.length} products in stock somewhere in the area.`);
   for (const n of data.notes) console.log(`Note: ${n}`);
 }
 
 // Shows the result on the GitHub Actions run page: a notice plus a table in the run summary.
 function reportToGitHub(data, inStock) {
-  const line = (p) => `${p.total === null ? "?" : p.total} × ${p.name}${p.price != null ? ` (CHF ${p.price.toFixed(2)})` : ""}`;
+  const line = (p) => `${p.total === null ? "?" : p.total} × ${p.name}${p.price != null ? ` (CHF ${p.price.toFixed(2)})` : ""}${p.total ? ": " + storeBreakdown(data, p) : ""}`;
   const stores = data.stores.map((s) => `${s.name} [${s.id}]`).join(", ");
-  const body = [`Stores: ${stores}`, ...data.products.map(line), ...data.notes.map((n) => `Note: ${n}`)].join("\n");
+  const body = [`${data.postcodes.length} postal codes, ${data.stores.length} stores: ${stores}`, ...data.products.map(line), ...data.notes.map((n) => `Note: ${n}`)].join("\n");
   const enc = (s) => s.replace(/%/g, "%25").replace(/\r/g, "%0D").replace(/\n/g, "%0A");
   console.log(`::notice title=${enc(`${inStock} of ${data.products.length} Pokémon products in stock`).replace(/[:,]/g, " ")}::${enc(body)}`);
   if (process.env.GITHUB_STEP_SUMMARY) {
     const cell = (s) => String(s).replace(/\|/g, "\\|");
-    const rows = data.products.map((p) => `| ${p.total ?? "?"} | ${cell(p.name)} | ${p.price != null ? p.price.toFixed(2) : ""} |`);
+    const rows = data.products.map((p) => `| ${p.total ?? "?"} | ${cell(p.name)} | ${p.price != null ? p.price.toFixed(2) : ""} | ${cell(p.total ? storeBreakdown(data, p) : "")} |`);
     fs.appendFileSync(
       process.env.GITHUB_STEP_SUMMARY,
-      [`### ${inStock} of ${data.products.length} Pokémon products in stock`, "", `Stores: ${stores}`, "", "| Stock | Product | CHF |", "|---:|---|---:|", ...rows, ""].join("\n")
+      [`### ${inStock} of ${data.products.length} Pokémon products in stock`, "", `Stores: ${stores}`, "", "| Stock | Product | CHF | Where |", "|---:|---|---:|---|", ...rows, ""].join("\n")
     );
   }
 }
@@ -404,11 +482,12 @@ function renderPage(snapshot, { source = null, note = null } = {}) {
   if (snapshot) globals.push(`window.__DATA__=${JSON.stringify(snapshot).replace(/</g, "\\u003c")};`);
   if (source) globals.push(`window.__SOURCE__=${JSON.stringify(source)};`);
   const embedded = globals.length ? `<script>${globals.join("")}</script>` : "";
-  const place = escapeHtml(CONFIG.store);
+  const place = escapeHtml(CONFIG.place);
   const noteHtml = note ? `<p>${escapeHtml(note)}</p>` : "";
   return PAGE.replace("<!--DATA-->", () => embedded)
     .replace("<!--NOTE-->", () => noteHtml)
-    .replaceAll("{{PLACE}}", () => place);
+    .replaceAll("{{PLACE}}", () => place)
+    .replaceAll("{{RADIUS}}", () => String(CONFIG.maxKm));
 }
 
 function escapeHtml(s) {
@@ -420,7 +499,7 @@ const PAGE = `<!doctype html>
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover">
-<title>Pokémon at Migros {{PLACE}}</title>
+<title>Pokémon at Migros around {{PLACE}}</title>
 <link rel="preconnect" href="https://fonts.googleapis.com">
 <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
 <link href="https://fonts.googleapis.com/css2?family=Barlow:wght@400;500;600&family=Barlow+Condensed:wght@500;600;700&display=swap" rel="stylesheet">
@@ -429,7 +508,7 @@ const PAGE = `<!doctype html>
   --bg:#ECEEF1; --surface:#FFFFFF; --ink:#15181E; --muted:#596170; --line:#D8DCE2;
   --band:#FF6600; --action:#B83F00; --action-ink:#FFFFFF;
   --in:#0D7A42; --low:#A85700; --out:#8A909B; --promo:#C4002B;
-  --focus:#1F5FD6;
+  --focus:#1F5FD6; --hover:#E3E6EA;
   color-scheme:light;
 }
 @media (prefers-color-scheme:dark){
@@ -437,7 +516,7 @@ const PAGE = `<!doctype html>
     --bg:#111317; --surface:#1A1D22; --ink:#ECEEF1; --muted:#9BA2AE; --line:#2B2F36;
     --band:#FF6600; --action:#FF7A1F; --action-ink:#1A0B00;
     --in:#4BC488; --low:#F2A43B; --out:#6C727D; --promo:#FF6B86;
-    --focus:#7FA8FF;
+    --focus:#7FA8FF; --hover:#252930;
     color-scheme:dark;
   }
 }
@@ -448,14 +527,39 @@ body{margin:0;background:var(--bg);color:var(--ink);font:16px/1.45 Barlow,system
 .wrap{max-width:760px;margin:0 auto;padding:0 16px}
 header{padding:20px 0 8px}
 h1{font:600 clamp(30px,8vw,44px)/1 "Barlow Condensed",Barlow,sans-serif;margin:0;letter-spacing:-.01em}
+button,select,input{font:inherit;color:inherit}
+:focus-visible{outline:3px solid var(--focus);outline-offset:2px}
+
+.area{margin-top:16px}
+.chips{display:flex;flex-wrap:wrap;gap:6px;margin:0;padding:0;list-style:none}
+.chip{display:inline-flex;align-items:center;gap:6px;min-height:36px;padding:4px 6px 4px 12px;border:1px solid var(--line);border-radius:999px;background:var(--surface);cursor:pointer;font-size:15px}
+.chip b{font-weight:600;font-variant-numeric:tabular-nums}
+.chip .x{display:inline-grid;place-items:center;width:24px;height:24px;border-radius:50%;color:var(--muted);font-size:18px;line-height:1}
+.chip:hover .x{background:var(--hover);color:var(--ink)}
+.more{border:0;background:none;color:var(--action);font-weight:600;cursor:pointer;min-height:36px;padding:0 6px}
+.add{position:relative;margin-top:10px}
+.add input{width:100%;min-height:44px;padding:10px 12px;border:1px solid var(--line);border-radius:8px;background:var(--surface)}
+.suggest{position:absolute;z-index:5;left:0;right:0;top:calc(100% + 4px);margin:0;padding:4px;list-style:none;background:var(--surface);border:1px solid var(--line);border-radius:8px;max-height:min(320px,55vh);overflow:auto;box-shadow:0 10px 30px rgba(10,14,20,.18)}
+.suggest[hidden]{display:none}
+.suggest button{display:block;width:100%;text-align:left;border:0;background:none;padding:8px 10px;border-radius:6px;cursor:pointer;min-height:44px}
+.suggest button:hover,.suggest button.active{background:var(--hover)}
+.suggest b{font-variant-numeric:tabular-nums}
+.suggest small{display:block;color:var(--muted);font-size:13px}
+.suggest .none{padding:10px;color:var(--muted);font-size:15px}
+.tools{display:flex;flex-wrap:wrap;gap:4px 16px;margin-top:8px;font-size:14px;color:var(--muted)}
+.tools button{border:0;background:none;padding:0;color:var(--action);font-weight:600;cursor:pointer;min-height:32px}
 .stores{margin:10px 0 0;padding:0;list-style:none;color:var(--muted);font-size:15px}
-.stores li+li{margin-top:2px}
+.stores li+li{margin-top:4px}
 .stores b{color:var(--ink);font-weight:600}
+details.stores-wrap{margin-top:10px;font-size:15px;color:var(--muted)}
+details.stores-wrap summary{cursor:pointer;color:var(--ink);padding:6px 0}
+details.stores-wrap summary b{font-weight:600}
+details.stores-wrap .stores{margin-top:4px}
+
 .status{display:flex;align-items:center;justify-content:space-between;gap:12px;margin-top:16px;padding:12px 0;border-top:1px solid var(--line);border-bottom:1px solid var(--line)}
 .summary{margin:0;font-size:15px}
 .summary strong{font:600 20px/1 "Barlow Condensed",sans-serif}
 .updated{display:block;color:var(--muted);font-size:13px}
-button,select,input{font:inherit;color:inherit}
 .refresh{flex:none;border:0;border-radius:8px;background:var(--action);color:var(--action-ink);font-weight:600;padding:10px 16px;min-height:44px;cursor:pointer}
 .refresh[disabled]{opacity:.6;cursor:progress}
 .controls{display:flex;flex-wrap:wrap;gap:8px;margin:14px 0 6px}
@@ -465,9 +569,8 @@ button,select,input{font:inherit;color:inherit}
 .seg button{border:0;background:transparent;padding:8px 14px;min-height:42px;cursor:pointer;color:var(--muted)}
 .seg button[aria-pressed=true]{background:var(--ink);color:var(--surface);font-weight:600}
 #sort{flex:1 1 140px}
-#store{flex:1 1 100%}
 select{min-height:44px;padding:8px 10px;border:1px solid var(--line);border-radius:8px;background:var(--surface);max-width:100%}
-:focus-visible{outline:3px solid var(--focus);outline-offset:2px}
+
 .list{list-style:none;margin:8px 0 0;padding:0}
 .item{display:grid;grid-template-columns:64px 1fr auto;gap:14px;align-items:center;padding:14px 0;border-bottom:1px solid var(--line)}
 .thumb{width:64px;height:64px;border-radius:6px;background:var(--surface);object-fit:contain;display:block}
@@ -479,8 +582,9 @@ select{min-height:44px;padding:8px 10px;border:1px solid var(--line);border-radi
 .price.promo{color:var(--promo)}
 .was{text-decoration:line-through}
 .badge{font-size:12px;font-weight:600;color:var(--promo)}
-.per-store{margin:6px 0 0;padding:0;list-style:none;font-size:13px;color:var(--muted)}
-.per-store span{font-variant-numeric:tabular-nums;color:var(--ink);font-weight:600}
+.where{margin:6px 0 0;font-size:13px;color:var(--muted)}
+.where .w{white-space:nowrap}
+.where b{font-variant-numeric:tabular-nums;color:var(--ink);font-weight:600}
 .count{text-align:right;min-width:64px}
 .count .n{display:block;font:700 44px/0.9 "Barlow Condensed",sans-serif;font-variant-numeric:tabular-nums}
 .count .l{display:block;font-size:12px;margin-top:4px;color:var(--muted)}
@@ -496,7 +600,6 @@ footer p{margin:0 0 6px}
 @media (min-width:640px){
   .search{flex:1 1 200px}
   #sort{flex:0 1 auto}
-  #store{flex:0 1 auto}
   .item{grid-template-columns:80px 1fr auto}
   .thumb{width:80px;height:80px}
 }
@@ -510,8 +613,18 @@ footer p{margin:0 0 6px}
 <div class="band"></div>
 <div class="wrap">
   <header>
-    <h1>Pokémon at Migros {{PLACE}}</h1>
-    <ul class="stores" id="stores"></ul>
+    <h1>Pokémon at Migros around {{PLACE}}</h1>
+    <section class="area" id="area" aria-label="Postal codes" hidden>
+      <ul class="chips" id="chips"></ul>
+      <div class="add">
+        <input id="plz" type="text" inputmode="search" enterkeyhint="done" autocomplete="off" spellcheck="false"
+          placeholder="Add a postal code or town" aria-label="Add a postal code or town"
+          role="combobox" aria-autocomplete="list" aria-expanded="false" aria-controls="suggest">
+        <ul class="suggest" id="suggest" role="listbox" hidden></ul>
+      </div>
+      <div class="tools" id="tools"></div>
+      <div id="storeinfo"></div>
+    </section>
     <div class="status">
       <p class="summary" id="summary">Checking stock…</p>
       <button class="refresh" id="refresh" type="button">Refresh</button>
@@ -528,13 +641,13 @@ footer p{margin:0 0 6px}
       <option value="price">Lowest price</option>
       <option value="name">Name</option>
     </select>
-    <select id="store" aria-label="Store" hidden></select>
   </div>
   <main id="main"><p class="loading">Asking Migros what's on the shelf…</p></main>
   <footer>
     <!--NOTE-->
+    <p>Covers every postal code within {{RADIUS}} km of {{PLACE}}. A postal code without its own Migros shows the nearest one.</p>
     <p>Stock counts come from Migros' own availability data and can lag behind the shelf by a few hours.</p>
-    <p>Not affiliated with Migros.</p>
+    <p>Not affiliated with Migros. Postal code locations from GeoNames (CC BY 4.0).</p>
   </footer>
 </div>
 <!--DATA-->
@@ -543,8 +656,10 @@ footer p{margin:0 0 6px}
   const $ = (id) => document.getElementById(id);
   const snapshot = window.__DATA__ || null;   // data baked into the page
   const source = window.__SOURCE__ || null;   // static site: data.json next to the page
+  const STORAGE_KEY = "pokemon-migros-plz";
+  const CHIP_LIMIT = 8;
   let lastLoad = Date.now();
-  const state = { data: null, q: "", onlyInStock: true, store: "all", sort: "stock" };
+  const state = { data: null, selected: [], q: "", onlyInStock: true, sort: "stock", chipsOpen: false, active: -1 };
   const esc = (s) => String(s ?? "").replace(/[&<>"']/g, (c) => ({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#39;"})[c]);
   const chf = (n) => n == null ? "" : "CHF " + n.toFixed(2);
   const time = (iso) => {
@@ -555,10 +670,134 @@ footer p{margin:0 0 6px}
 
   if (snapshot && !source) $("refresh").hidden = true;
 
-  function countFor(p) {
-    if (state.store === "all") return p.total;
-    const n = p.stock[state.store];
-    return n === undefined ? null : n;
+  // ── Postal code selection ────────────────────────────────────────────────
+  const byPlz = () => new Map(state.data.postcodes.map((p) => [p.plz, p]));
+  const storeById = () => new Map(state.data.stores.map((s) => [s.id, s]));
+
+  function initialSelection() {
+    const valid = byPlz();
+    const clean = (list) => list.map((x) => String(x).trim()).filter((x, i, a) => valid.has(x) && a.indexOf(x) === i);
+    const fromUrl = clean((new URLSearchParams(location.search).get("plz") || "").split(","));
+    if (fromUrl.length) return fromUrl;
+    try {
+      const saved = clean(JSON.parse(localStorage.getItem(STORAGE_KEY) || "[]"));
+      if (saved.length) return saved;
+    } catch (e) { /* storage unavailable */ }
+    return clean(state.data.defaultPostcodes || []).length ? clean(state.data.defaultPostcodes) : [state.data.postcodes[0].plz];
+  }
+
+  function saveSelection() {
+    try { localStorage.setItem(STORAGE_KEY, JSON.stringify(state.selected)); } catch (e) { /* storage unavailable */ }
+    try {
+      const params = new URLSearchParams(location.search);
+      params.delete("plz");
+      const rest = params.toString();
+      const query = [state.selected.length ? "plz=" + state.selected.join(",") : "", rest].filter(Boolean).join("&");
+      history.replaceState(null, "", location.pathname + (query ? "?" + query : "") + location.hash);
+    } catch (e) { /* file:// or sandboxed */ }
+  }
+
+  function setSelection(list) {
+    state.selected = list;
+    saveSelection();
+    renderArea();
+    render();
+  }
+
+  function addPlz(plz) {
+    if (!state.selected.includes(plz)) setSelection(state.selected.concat(plz));
+    $("plz").value = "";
+    state.active = -1;
+    renderSuggest();
+  }
+
+  function removePlz(plz) { setSelection(state.selected.filter((p) => p !== plz)); }
+
+  function selectedStores() {
+    const pcs = byPlz();
+    const stores = storeById();
+    const ids = [...new Set(state.selected.flatMap((plz) => (pcs.get(plz) ? pcs.get(plz).stores : [])))];
+    return ids.map((id) => stores.get(id)).filter(Boolean);
+  }
+
+  function serves(pc) {
+    const stores = storeById();
+    const names = pc.stores.map((id) => (stores.get(id) || {}).name).filter(Boolean);
+    if (pc.nearest) return "Nearest Migros: " + names[0] + (pc.nearestKm != null ? ", " + pc.nearestKm.toFixed(1) + " km" : "");
+    return "Migros " + names.join(", ");
+  }
+
+  function renderArea() {
+    const d = state.data;
+    $("area").hidden = false;
+    const pcs = byPlz();
+    const sel = state.selected.map((plz) => pcs.get(plz)).filter(Boolean);
+    const shown = state.chipsOpen || sel.length <= CHIP_LIMIT ? sel : sel.slice(0, CHIP_LIMIT - 2);
+    $("chips").innerHTML = shown.map((pc) =>
+      '<li><button type="button" class="chip" data-remove="' + esc(pc.plz) + '" aria-label="Remove ' + esc(pc.plz + " " + pc.name) + '">' +
+      "<span><b>" + esc(pc.plz) + "</b> " + esc(pc.name) + '</span><span class="x" aria-hidden="true">×</span></button></li>'
+    ).join("") + (shown.length < sel.length ? '<li><button type="button" class="more" data-chips="open">and ' + (sel.length - shown.length) + " more</button></li>" : "")
+      + (state.chipsOpen && sel.length > CHIP_LIMIT ? '<li><button type="button" class="more" data-chips="close">Show fewer</button></li>' : "");
+
+    const left = d.postcodes.length - sel.length;
+    $("tools").innerHTML =
+      (left > 0 ? '<button type="button" data-all>Add all ' + d.postcodes.length + " postal codes</button>" : "<span>All " + d.postcodes.length + " postal codes within " + esc(d.radiusKm) + " km added</span>") +
+      (sel.length > 1 ? '<button type="button" data-clear>Remove all</button>' : "");
+
+    const stores = selectedStores();
+    const nearestFor = {};
+    for (const pc of sel) if (pc.nearest) (nearestFor[pc.stores[0]] = nearestFor[pc.stores[0]] || []).push(pc.name);
+    const items = stores.map((s) =>
+      "<li><b>" + esc(s.name) + "</b>" + (s.address ? ", " + esc(s.address) : "") +
+      (s.hoursToday ? (s.hoursToday === "closed" ? ". Closed today." : ". Open today " + esc(s.hoursToday) + ".") : "") +
+      (nearestFor[s.id] ? " Nearest Migros for " + esc(nearestFor[s.id].join(", ")) + "." : "") + "</li>"
+    ).join("");
+    $("storeinfo").innerHTML = !stores.length ? ""
+      : stores.length <= 3 ? '<ul class="stores">' + items + "</ul>"
+      : '<details class="stores-wrap"><summary><b>' + stores.length + " Migros stores</b>" +
+        (stores.length <= 6 ? ": " + stores.map((s) => esc(s.name)).join(", ") : "") +
+        '</summary><ul class="stores">' + items + "</ul></details>";
+  }
+
+  function matches() {
+    const q = $("plz").value.trim().toLowerCase();
+    const avail = state.data.postcodes.filter((pc) => !state.selected.includes(pc.plz));
+    if (!q) return avail;
+    return avail.filter((pc) => pc.plz.startsWith(q) || pc.name.toLowerCase().includes(q));
+  }
+
+  function renderSuggest(open) {
+    const box = $("suggest");
+    const input = $("plz");
+    const show = open === undefined ? !box.hidden : open;
+    if (!show || !state.data) { box.hidden = true; input.setAttribute("aria-expanded", "false"); return; }
+    const list = matches();
+    const q = input.value.trim();
+    if (!list.length) {
+      box.innerHTML = '<li class="none">' + (q
+        ? "No postal code within " + esc(state.data.radiusKm) + " km of " + esc(state.data.place) + " matches “" + esc(q) + "”."
+        : "All postal codes are added.") + "</li>";
+    } else {
+      if (state.active >= list.length) state.active = list.length - 1;
+      box.innerHTML = list.map((pc, i) =>
+        '<li role="option" aria-selected="' + (i === state.active) + '"><button type="button" tabindex="-1" data-add="' + esc(pc.plz) + '"' + (i === state.active ? ' class="active"' : "") + ">" +
+        "<b>" + esc(pc.plz) + "</b> " + esc(pc.name) + "<small>" + esc(serves(pc)) + "</small></button></li>"
+      ).join("");
+      const act = box.querySelector(".active");
+      if (act) act.scrollIntoView({ block: "nearest" });
+    }
+    box.hidden = false;
+    input.setAttribute("aria-expanded", "true");
+  }
+
+  // ── Product list ─────────────────────────────────────────────────────────
+  function countFor(p, stores) {
+    let sum = 0, known = 0;
+    for (const s of stores) {
+      const n = p.stock[s.id];
+      if (n != null) { sum += n; known++; }
+    }
+    return known ? sum : null;
   }
 
   function level(n) {
@@ -568,36 +807,31 @@ footer p{margin:0 0 6px}
     return ["in", "in stock"];
   }
 
-  function renderStores(d) {
-    $("stores").innerHTML = d.stores.map((s) =>
-      "<li><b>" + esc(s.name) + "</b>" + (s.address ? ", " + esc(s.address) : "") +
-      (s.hoursToday ? (s.hoursToday === "closed" ? ". Closed today." : ". Open today " + esc(s.hoursToday) + ".") : "") + "</li>"
-    ).join("");
-    const sel = $("store");
-    if (d.stores.length > 1) {
-      sel.innerHTML = '<option value="all">All ' + esc(d.place) + ' stores</option>' +
-        d.stores.map((s) => '<option value="' + esc(s.id) + '">' + esc(s.name) + "</option>").join("");
-      sel.value = d.stores.some((s) => s.id === state.store) ? state.store : "all";
-      sel.hidden = false;
-    } else {
-      sel.hidden = true;
-      state.store = "all";
-    }
-  }
-
   function render() {
     const d = state.data;
     if (!d) return;
+    const stores = selectedStores();
     const all = d.products;
-    const inStockCount = all.filter((p) => (countFor(p) ?? 0) > 0).length;
+    const count = (p) => countFor(p, stores);
+
+    if (!stores.length) {
+      $("summary").innerHTML = "No postal code selected" + '<span class="updated">Updated ' + esc(time(d.generatedAt)) + "</span>";
+      $("controls").hidden = true;
+      $("main").innerHTML = '<div class="empty"><p>Add a postal code to see what\\'s in stock nearby.</p></div>';
+      return;
+    }
+    $("controls").hidden = false;
+
+    const inStockCount = all.filter((p) => (count(p) ?? 0) > 0).length;
     $("summary").innerHTML = "<strong>" + inStockCount + "</strong> of " + all.length + " products in stock" +
+      (stores.length > 1 ? " across " + stores.length + " stores" : " at Migros " + esc(stores[0].name)) +
       '<span class="updated">Updated ' + esc(time(d.generatedAt)) + "</span>";
 
     const q = state.q.trim().toLowerCase();
     let rows = all.filter((p) => !q || (p.name + " " + p.brand).toLowerCase().includes(q));
-    if (state.onlyInStock) rows = rows.filter((p) => (countFor(p) ?? 0) > 0);
+    if (state.onlyInStock) rows = rows.filter((p) => (count(p) ?? 0) > 0);
     const by = {
-      stock: (a, b) => (countFor(b) ?? -1) - (countFor(a) ?? -1) || a.name.localeCompare(b.name, "de"),
+      stock: (a, b) => (count(b) ?? -1) - (count(a) ?? -1) || a.name.localeCompare(b.name, "de"),
       price: (a, b) => (a.price ?? 1e9) - (b.price ?? 1e9),
       name: (a, b) => a.name.localeCompare(b.name, "de"),
     }[state.sort];
@@ -606,36 +840,41 @@ footer p{margin:0 0 6px}
     const notes = d.notes.map((n) => '<p class="empty">' + esc(n) + "</p>").join("");
     if (!rows.length) {
       const msg = !all.length ? "Migros doesn't list any Pokémon products right now."
-        : q ? "Nothing matches \\u201c" + esc(state.q.trim()) + "\\u201d."
-        : "Nothing is in stock right now.";
+        : q ? "Nothing matches “" + esc(state.q.trim()) + "”."
+        : "Nothing is in stock at " + (stores.length > 1 ? "these stores" : "this store") + " right now.";
       const action = state.onlyInStock && all.length ? '<button class="linkish" type="button" data-show-all>Show sold-out products too</button>' : "";
       $("main").innerHTML = notes + '<div class="empty"><p>' + msg + "</p>" + action + "</div>";
       return;
     }
 
-    const multi = d.stores.length > 1 && state.store === "all";
+    const multi = stores.length > 1;
     $("main").innerHTML = notes + '<ul class="list">' + rows.map((p) => {
-      const n = countFor(p);
+      const n = count(p);
       const [cls, label] = level(n);
       const img = p.image
-        ? '<img class="thumb" src="' + esc(p.image) + '" alt="" loading="lazy" referrerpolicy="no-referrer">'
+        ? '<img class="thumb" src="' + esc(p.image) + '" alt="" loading="lazy" referrerpolicy="no-referrer" onerror="this.removeAttribute(\\'src\\');this.className=\\'thumb none\\'">'
         : '<div class="thumb none"></div>';
       const price = p.price == null ? "" : p.regularPrice != null
         ? '<span class="price promo">' + chf(p.price) + '</span><span class="was">' + chf(p.regularPrice) + "</span>"
         : '<span class="price">' + chf(p.price) + "</span>";
       const badges = p.badges.map((b) => '<span class="badge">' + esc(b) + "</span>").join("");
       const qty = p.quantity ? "<span>" + esc(p.quantity) + "</span>" : "";
-      const per = multi ? '<ul class="per-store">' + d.stores.map((s) => {
-        const v = p.stock[s.id];
-        return "<li>" + esc(s.name) + ": <span>" + (v == null ? "?" : v) + "</span></li>";
-      }).join("") + "</ul>" : "";
+      let where = "";
+      if (multi && n) {
+        const have = stores.filter((s) => p.stock[s.id] !== 0)
+          .sort((a, b) => (p.stock[b.id] ?? -1) - (p.stock[a.id] ?? -1));
+        const parts = have.slice(0, 5).map((s) => '<span class="w">' + esc(s.name) + " <b>" + (p.stock[s.id] == null ? "?" : p.stock[s.id]) + "</b></span>");
+        if (have.length > 5) parts.push("and " + (have.length - 5) + " more stores");
+        where = '<p class="where">' + parts.join(", ") + "</p>";
+      }
       return '<li class="item ' + cls + '">' + img +
         '<div><a class="name" href="' + esc(p.url) + '" target="_blank" rel="noopener">' + esc(p.name) + "</a>" +
-        '<div class="meta">' + price + qty + badges + "</div>" + per + "</div>" +
+        '<div class="meta">' + price + qty + badges + "</div>" + where + "</div>" +
         '<div class="count" aria-label="' + (n == null ? "Stock unknown" : n + " in stock") + '"><span class="n">' + (n == null ? "?" : n) + '</span><span class="l">' + label + "</span></div></li>";
     }).join("") + "</ul>";
   }
 
+  // ── Loading ──────────────────────────────────────────────────────────────
   function showError(msg) {
     $("summary").textContent = "Couldn't load the stock list.";
     const hint = source ? "Check your connection, then refresh." : "Migros sometimes blocks a burst of requests. Wait a minute, then refresh.";
@@ -667,19 +906,46 @@ footer p{margin:0 0 6px}
   }
 
   function afterLoad() {
-    renderStores(state.data);
-    $("controls").hidden = false;
+    const valid = byPlz();
+    state.selected = state.selected.length ? state.selected.filter((p) => valid.has(p)) : initialSelection();
+    saveSelection();
+    renderArea();
     render();
   }
 
+  // ── Events ───────────────────────────────────────────────────────────────
   $("refresh").addEventListener("click", () => load(true));
-  // On the hosted page, pick up the latest check when the tab is reopened.
   document.addEventListener("visibilitychange", () => {
     if (source && document.visibilityState === "visible" && Date.now() - lastLoad > 5 * 60e3) load(true, true);
   });
+
+  $("area").addEventListener("click", (e) => {
+    const t = e.target.closest("button");
+    if (!t) return;
+    if (t.dataset.remove) removePlz(t.dataset.remove);
+    else if (t.dataset.add) { addPlz(t.dataset.add); $("plz").focus(); }
+    else if (t.dataset.chips) { state.chipsOpen = t.dataset.chips === "open"; renderArea(); }
+    else if (t.hasAttribute("data-all")) setSelection(state.data.postcodes.map((p) => p.plz));
+    else if (t.hasAttribute("data-clear")) setSelection([]);
+  });
+  $("suggest").addEventListener("mousedown", (e) => e.preventDefault()); // keep focus in the input
+  const input = $("plz");
+  input.addEventListener("focus", () => { state.active = -1; renderSuggest(true); });
+  input.addEventListener("input", () => { state.active = input.value.trim() ? 0 : -1; renderSuggest(true); });
+  input.addEventListener("blur", () => setTimeout(() => renderSuggest(false), 120));
+  input.addEventListener("keydown", (e) => {
+    const list = matches();
+    if (e.key === "ArrowDown") { e.preventDefault(); state.active = Math.min(list.length - 1, state.active + 1); renderSuggest(true); }
+    else if (e.key === "ArrowUp") { e.preventDefault(); state.active = Math.max(0, state.active - 1); renderSuggest(true); }
+    else if (e.key === "Enter") {
+      e.preventDefault();
+      const pick = list[state.active >= 0 ? state.active : 0];
+      if (pick && input.value.trim()) addPlz(pick.plz);
+    } else if (e.key === "Escape") { renderSuggest(false); input.blur(); }
+  });
+
   $("q").addEventListener("input", (e) => { state.q = e.target.value; render(); });
   $("sort").addEventListener("change", (e) => { state.sort = e.target.value; render(); });
-  $("store").addEventListener("change", (e) => { state.store = e.target.value; render(); });
   const setFilter = (inOnly) => {
     state.onlyInStock = inOnly;
     $("f-in").setAttribute("aria-pressed", String(inOnly));
@@ -737,7 +1003,7 @@ async function main() {
         fs.writeFileSync(`${dir}/data.json`, JSON.stringify(data));
         fs.writeFileSync(`${dir}/index.html`, renderPage(data, { source: "data.json", note }));
         const inStock = data.products.filter((p) => p.total > 0).length;
-        console.log(`Wrote ${dir}/index.html and ${dir}/data.json: ${data.products.length} products, ${inStock} in stock, stores ${data.stores.map((s) => s.name).join(", ")}`);
+        console.log(`Wrote ${dir}/index.html and ${dir}/data.json: ${data.products.length} products, ${inStock} in stock, ${data.postcodes.length} postal codes, ${data.stores.length} stores (${data.tookMs} ms)`);
         if (process.env.GITHUB_ACTIONS) reportToGitHub(data, inStock);
       }
     } catch (err) {
@@ -771,7 +1037,7 @@ async function main() {
   });
 
   server.listen(CONFIG.port, CONFIG.host, () => {
-    console.log(`Pokémon stock for Migros ${CONFIG.store} is running.`);
+    console.log(`Pokémon stock for Migros around ${CONFIG.place} is running.`);
     console.log(`  On this computer:  http://localhost:${CONFIG.port}`);
     if (CONFIG.host === "0.0.0.0") for (const ip of lanAddresses()) console.log(`  On your phone:     http://${ip}:${CONFIG.port}  (same Wi-Fi)`);
     console.log("Press Ctrl+C to stop.\n");
