@@ -380,6 +380,23 @@ function printList(data) {
   for (const n of data.notes) console.log(`Note: ${n}`);
 }
 
+// Shows the result on the GitHub Actions run page: a notice plus a table in the run summary.
+function reportToGitHub(data, inStock) {
+  const line = (p) => `${p.total === null ? "?" : p.total} × ${p.name}${p.price != null ? ` (CHF ${p.price.toFixed(2)})` : ""}`;
+  const stores = data.stores.map((s) => `${s.name} [${s.id}]`).join(", ");
+  const body = [`Stores: ${stores}`, ...data.products.map(line), ...data.notes.map((n) => `Note: ${n}`)].join("\n");
+  const enc = (s) => s.replace(/%/g, "%25").replace(/\r/g, "%0D").replace(/\n/g, "%0A");
+  console.log(`::notice title=${enc(`${inStock} of ${data.products.length} Pokémon products in stock`).replace(/[:,]/g, " ")}::${enc(body)}`);
+  if (process.env.GITHUB_STEP_SUMMARY) {
+    const cell = (s) => String(s).replace(/\|/g, "\\|");
+    const rows = data.products.map((p) => `| ${p.total ?? "?"} | ${cell(p.name)} | ${p.price != null ? p.price.toFixed(2) : ""} |`);
+    fs.appendFileSync(
+      process.env.GITHUB_STEP_SUMMARY,
+      [`### ${inStock} of ${data.products.length} Pokémon products in stock`, "", `Stores: ${stores}`, "", "| Stock | Product | CHF |", "|---:|---|---:|", ...rows, ""].join("\n")
+    );
+  }
+}
+
 // ─── Page ───────────────────────────────────────────────────────────────────
 
 function renderPage(snapshot, { source = null, note = null } = {}) {
@@ -721,6 +738,7 @@ async function main() {
         fs.writeFileSync(`${dir}/index.html`, renderPage(data, { source: "data.json", note }));
         const inStock = data.products.filter((p) => p.total > 0).length;
         console.log(`Wrote ${dir}/index.html and ${dir}/data.json: ${data.products.length} products, ${inStock} in stock, stores ${data.stores.map((s) => s.name).join(", ")}`);
+        if (process.env.GITHUB_ACTIONS) reportToGitHub(data, inStock);
       }
     } catch (err) {
       console.error(describe(err));
