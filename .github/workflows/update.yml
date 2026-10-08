@@ -1,0 +1,58 @@
+name: Update stock page
+
+on:
+  schedule:
+    # Every 30 minutes, roughly 06:00–22:00 Swiss time (GitHub's cron runs in UTC,
+    # and scheduled runs can start a few minutes late when GitHub is busy).
+    - cron: "7,37 4-20 * * *"
+  # Adds a "Run workflow" button under the Actions tab for an immediate update.
+  workflow_dispatch:
+  # Redeploy right away when the code changes.
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+  pages: write
+  id-token: write
+
+# Never run two updates at once.
+concurrency:
+  group: pages
+  cancel-in-progress: false
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v7
+
+      # If Migros fails or returns nothing, this step fails and the last good
+      # page stays online (its "Updated" time shows how old it is).
+      - name: Fetch Pokémon stock from Migros
+        run: node migros-pokemon.mjs --site public --note "Checked automatically every 30 minutes during the day."
+
+      - uses: actions/upload-pages-artifact@v5
+        with:
+          path: public
+
+  deploy:
+    needs: build
+    runs-on: ubuntu-latest
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    steps:
+      - id: deployment
+        uses: actions/deploy-pages@v5
+
+  # GitHub switches off scheduled workflows in public repos after 60 days
+  # without activity. This re-enables the workflow on every scheduled run.
+  keepalive:
+    if: github.event_name == 'schedule'
+    runs-on: ubuntu-latest
+    permissions:
+      actions: write
+    steps:
+      - uses: liskin/gh-workflow-keepalive@v1
